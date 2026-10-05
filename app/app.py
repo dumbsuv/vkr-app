@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, VotingRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import ElasticNet, Lasso, LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -46,6 +46,8 @@ METHODS = {
                                 "тетради консультанта.",
     "k ближайших соседей (kNN)": "Оценка — среднее уровня преступности у k самых похожих по факторам строк.",
     "Случайный лес": "Среднее множества деревьев решений вида «безработица больше 7 %? да/нет → …».",
+    "Гибридная модель (лес + kNN)": "Ансамбль методов: оценка — среднее оценок случайного леса и k ближайших "
+                                    "соседей. Состав выбран в ноутбуке 05 перебором всех сочетаний методов.",
 }
 
 st.set_page_config(page_title="Факторы преступности в регионах РФ", layout="wide")
@@ -79,6 +81,9 @@ def make_model(method, p):
                              StandardScaler(), final)
     if method == "k ближайших соседей (kNN)":
         return scaled(KNeighborsRegressor(n_neighbors=p["k"]))
+    if method == "Гибридная модель (лес + kNN)":
+        return VotingRegressor([("лес", RandomForestRegressor(n_estimators=p["trees"], random_state=1, n_jobs=-1)),
+                                ("kNN", scaled(KNeighborsRegressor(n_neighbors=p["k"])))])
     return RandomForestRegressor(n_estimators=p["trees"], random_state=1, n_jobs=-1)
 
 
@@ -91,6 +96,7 @@ DEFAULTS = {
     "Полиномиальная регрессия": {"degree": 2, "use_ridge": True, "alpha": 10},
     "k ближайших соседей (kNN)": {"k": 5},
     "Случайный лес": {"trees": 300},
+    "Гибридная модель (лес + kNN)": {"k": 5, "trees": 300},
 }
 
 
@@ -158,6 +164,7 @@ GRIDS = {
     "Полиномиальная регрессия": [{"degree": d, "use_ridge": True, "alpha": a} for d in range(1, 5) for a in ALPHAS],
     "k ближайших соседей (kNN)": [{"k": k} for k in [1, 3, 5, 7, 10, 15, 20, 30]],
     "Случайный лес": [{"trees": t} for t in [50, 100, 300, 500]],
+    "Гибридная модель (лес + kNN)": [{"k": k, "trees": t} for k in [3, 5, 7, 10] for t in [100, 300]],
 }
 
 
@@ -203,7 +210,7 @@ for key, value in {"degree": 2, "alpha": 10, "k": 5, "trees": 300, "use_ridge": 
 
 st.sidebar.header("Настройки модели")
 
-method = st.sidebar.selectbox("Метод", list(METHODS), index=4, key="method",
+method = st.sidebar.selectbox("Метод", list(METHODS), index=len(METHODS) - 1, key="method",
                               help="Каким способом строится связь факторов с уровнем преступности.")
 st.sidebar.caption(METHODS[method])
 
@@ -233,12 +240,12 @@ if method in ("Lasso", "Ridge", "ElasticNet") or (method == "Полиномиа�
              "много (1000) — модель осторожная и простая, может недоучиться.")
 elif method == "Полиномиальная регрессия":
     params["alpha"] = None
-if method == "k ближайших соседей (kNN)":
+if method in ("k ближайших соседей (kNN)", "Гибридная модель (лес + kNN)"):
     params["k"] = st.sidebar.slider(
         "Число соседей k", 1, 30, key="k",
         help="Сколько самых похожих строк усреднять. Мало соседей — модель повторяет отдельные строки и "
              "переобучается; много — оценки сглаживаются и становятся грубее.")
-if method == "Случайный лес":
+if method in ("Случайный лес", "Гибридная модель (лес + kNN)"):
     params["trees"] = st.sidebar.select_slider(
         "Число деревьев", options=[50, 100, 300, 500], key="trees",
         help="Больше деревьев — устойчивее результат, но дольше расчёт.")
@@ -281,7 +288,7 @@ with st.expander("Что делает приложение и как его чи
 в уже обученную модель.
 
 **Вкладки:**
-- «Сравнение методов» — все семь методов на одних данных: какой точнее;
+- «Сравнение методов» — все восемь методов на одних данных: какой точнее;
 - «Регион» — реальный уровень преступности в регионе по годам и оценка модели;
 - «Качество модели» — насколько точно выбранная модель угадывает спрятанные данные;
 - «Влияние факторов» — какие показатели важнее для модели и в какую сторону они тянут оценку;
@@ -387,7 +394,8 @@ with tab_model:
                  "Lasso": ("alpha", ALPHAS, "alpha"), "Ridge": ("alpha", ALPHAS, "alpha"),
                  "ElasticNet": ("alpha", ALPHAS, "alpha"),
                  "k ближайших соседей (kNN)": ("k", [1, 3, 5, 7, 10, 15, 20, 30], "число соседей k"),
-                 "Случайный лес": ("trees", [50, 100, 300, 500], "число деревьев")}.get(method)
+                 "Случайный лес": ("trees", [50, 100, 300, 500], "число деревьев"),
+                 "Гибридная модель (лес + kNN)": ("k", [1, 3, 5, 7, 10, 15, 20, 30], "число соседей k")}.get(method)
         if curve:
             key, values, label = curve
             rows = []
