@@ -1,8 +1,8 @@
 """Приложение: влияние социально-экономических факторов на преступность в регионах РФ.
 
 Запуск из корня репозитория:  streamlit run app/app.py
-Данные: data/processed/panel.csv (очищенная таблица, ноутбук 03) и data/processed/features.json
-(итоговые факторы, ноутбук 04).
+Данные: data/processed/panel.csv (очищенная таблица, ноутбук 03), data/processed/features.json
+(итоговые факторы, ноутбук 04), data/processed/crime_categories.csv (уровни по видам преступлений, ноутбук 07).
 
 Прототип интерфейса методики: модели обучаются прямо в приложении.
 """
@@ -28,7 +28,31 @@ DATA_PATH = ROOT / "data" / "processed" / "panel.csv"
 FEATURES_PATH = ROOT / "data" / "processed" / "features.json"
 PARAMS_PATH = ROOT / "data" / "processed" / "final_params.json"  # параметры, подобранные в ноутбуке 06
 FINAL_PATH = ROOT / "data" / "processed" / "final_comparison.csv"  # результаты сравнения из ноутбука 06
-TARGET = "crime_rate"
+CAT_PATH = ROOT / "data" / "processed" / "crime_categories.csv"  # уровни по видам преступлений, ноутбук 07
+CAT_COMPARE_PATH = ROOT / "data" / "processed" / "category_comparison.csv"  # точность по видам, ноутбук 07
+CAT_FACTORS_PATH = ROOT / "data" / "processed" / "category_factors.csv"  # важность и направление по видам
+
+# Виды преступлений: название в интерфейсе → (ключ, столбец с уровнем на 100 тыс. жителей)
+CATEGORIES = {
+    "Все преступления": ("all", "rate_all"),
+    "Тяжкие и особо тяжкие": ("grave", "rate_grave"),
+    "Небольшой и средней тяжести": ("minor", "rate_minor"),
+    "Экономической направленности": ("econ", "rate_econ"),
+    "Связанные с наркотиками": ("drugs", "rate_drugs"),
+    "Убийства и покушения на убийство": ("murder", "rate_murder"),
+}
+# Полные названия видов для заголовков и пояснений
+CATEGORY_PHRASE = {
+    "Все преступления": "все преступления",
+    "Тяжкие и особо тяжкие": "тяжкие и особо тяжкие преступления",
+    "Небольшой и средней тяжести": "преступления небольшой и средней тяжести",
+    "Экономической направленности": "преступления экономической направленности",
+    "Связанные с наркотиками": "преступления, связанные с незаконным оборотом наркотиков",
+    "Убийства и покушения на убийство": "убийства и покушения на убийство",
+}
+CATEGORY_HELP = ("Какие преступления считать. «Все преступления» — основной показатель работы. Остальные виды "
+                 "позволяют проверить, одинаково ли факторы связаны с разными преступлениями. Модели для каждого "
+                 "вида обучаются отдельно.")
 
 FEATURES_INFO = json.loads(FEATURES_PATH.read_text(encoding="utf-8"))
 BASE = FEATURES_INFO["base"]            # 7 социально-экономических факторов
@@ -75,8 +99,15 @@ def load_final():
 
 @st.cache_data
 def load_data():
-    """Читает очищенную таблицу «регион × год»."""
-    return pd.read_csv(DATA_PATH)
+    """Читает очищенную таблицу «регион × год» и добавляет уровни по видам преступлений."""
+    panel = pd.read_csv(DATA_PATH)
+    return panel.merge(pd.read_csv(CAT_PATH), on=["region", "year"], how="left")
+
+
+@st.cache_data
+def load_categories():
+    """Готовые результаты ноутбука 07: точность моделей, важность и направление факторов по видам."""
+    return pd.read_csv(CAT_COMPARE_PATH), pd.read_csv(CAT_FACTORS_PATH, index_col=0)
 
 
 data = load_data()
@@ -146,21 +177,21 @@ num = lambda v, d: f"{v:,.{d}f}".replace(",", " ").replace(".", ",")  # 12 345,6
 
 
 @st.cache_resource
-def train(features, method, params, split_type):
-    """Обучает модель; результат запоминается, чтобы не переобучать при каждом клике."""
+def train(features, method, params, split_type, target):
+    """Обучает модель для столбца target; результат запоминается, чтобы не переобучать при каждом клике."""
     tr, te = split_rows(split_type)
     model = make_model(method, dict(params))
-    model.fit(data.loc[tr, list(features)], data.loc[tr, TARGET])
+    model.fit(data.loc[tr, list(features)], data.loc[tr, target])
     return model, tr, te
 
 
 @st.cache_data
-def compare_methods(features, split_type):
+def compare_methods(features, split_type, target):
     """Обучает все методы с параметрами по умолчанию и возвращает таблицу метрик."""
     rows = []
     for method, p in DEFAULTS.items():
-        model, tr, te = train(features, method, freeze(p), split_type)
-        X, y = data[list(features)], data[TARGET]
+        model, tr, te = train(features, method, freeze(p), split_type, target)
+        X, y = data[list(features)], data[target]
         p_tr, p_te = model.predict(X.iloc[tr]), model.predict(X.iloc[te])
         label = method + (f", степень {p['degree']}" if "degree" in p else "")
         rows.append({"метод": label, "R² на тесте": r2_score(y.iloc[te], p_te),
@@ -170,10 +201,10 @@ def compare_methods(features, split_type):
 
 
 @st.cache_data
-def factor_effects(features, method, params, split_type):
+def factor_effects(features, method, params, split_type, target):
     """Важность (падение R² при перемешивании фактора) и направление (эффект роста фактора на 10 %)."""
-    model, tr, te = train(features, method, params, split_type)
-    X_te, y_te = data.loc[te, list(features)], data.loc[te, TARGET]
+    model, tr, te = train(features, method, params, split_type, target)
+    X_te, y_te = data.loc[te, list(features)], data.loc[te, target]
     perm = permutation_importance(model, X_te, y_te, scoring="r2", n_repeats=5, random_state=1)
     base = model.predict(X_te)
     rows = []
@@ -199,11 +230,11 @@ GRIDS = {
 }
 
 
-def tune(features, method, split_type):
+def tune(features, method, split_type, target):
     """Перебирает параметры метода с перекрёстной проверкой на обучающей выборке (5 частей).
     Тестовая выборка в подборе не участвует, иначе её оценка станет завышенной."""
     tr, _ = split_rows(split_type)
-    X, y = data.loc[tr, list(features)], data.loc[tr, TARGET]
+    X, y = data.loc[tr, list(features)], data.loc[tr, target]
     if split_type.startswith("По регионам"):
         cv, groups = GroupKFold(n_splits=5), data.loc[tr, "region"]
     else:
@@ -219,10 +250,14 @@ def current_features():
     return BASE + (CONTROL if st.session_state.get("use_control", True) else [])
 
 
+def current_target():
+    return CATEGORIES[st.session_state.get("category", "Все преступления")][1]
+
+
 def on_tune():
     """Кнопка подбора: ставит лучшие параметры в боковую панель."""
-    method, split_type = st.session_state.method, st.session_state.split_type
-    table = tune(tuple(current_features()), method, split_type)
+    method, split_type, target = st.session_state.method, st.session_state.split_type, current_target()
+    table = tune(tuple(current_features()), method, split_type, target)
     best = table.iloc[0]
     for key in ["degree", "k", "trees"]:
         if key in best and not pd.isna(best[key]):
@@ -236,7 +271,7 @@ def on_tune():
     if method == "Полиномиальная регрессия":
         st.session_state.use_ridge = True
     st.session_state.tune_table = table
-    st.session_state.tune_for = (tuple(current_features()), method, split_type)
+    st.session_state.tune_for = (tuple(current_features()), method, split_type, target)
 
 
 # ---------- Сценарий «что, если» по усреднённой зависимости ----------
@@ -245,7 +280,7 @@ PERCENT_FEATURES = [f for f, name in FEATURE_NAMES.items() if name.endswith("%")
 
 
 @st.cache_data
-def scenario_effects(features, method, params, split_type, changes):
+def scenario_effects(features, method, params, split_type, target, changes):
     """Как в среднем меняется оценка модели, если изменить факторы на заданные проценты.
 
     changes — изменения факторов в процентах (в том же порядке, что features).
@@ -253,7 +288,7 @@ def scenario_effects(features, method, params, split_type, changes):
     Шаг 2: сравнивается средняя оценка модели до и после сдвига.
     Усреднение по многим регионам сглаживает ступенчатый отклик леса и kNN в отдельной точке.
     Возвращает общее изменение в процентах и изменение от каждого фактора по отдельности."""
-    model, tr, te = train(features, method, params, split_type)
+    model, tr, te = train(features, method, params, split_type, target)
     X_te = data.loc[te, list(features)]
     base = model.predict(X_te).mean()
     changes = np.array(changes, dtype=float)
@@ -310,29 +345,33 @@ if mode == SIMPLE:
                 "как с уровнем преступности связаны занятость, доходы, образование и другие условия. "
                 f"Расчёты основаны на данных по 85 регионам за {data['year'].min()}–{data['year'].max()} гг.")
 
-    s_region = st.selectbox("Выберите регион", regions, index=regions.index(DEMO_REGION), key="s_region")
+    col_r, col_c = st.columns(2)
+    s_region = col_r.selectbox("Выберите регион", regions, index=regions.index(DEMO_REGION), key="s_region")
+    category = col_c.selectbox("Вид преступлений", list(CATEGORIES), key="category", help=CATEGORY_HELP)
+    target = CATEGORIES[category][1]
     reg = data[data["region"] == s_region].sort_values("year")
     last, first = reg.iloc[-1], reg.iloc[0]
     year = int(last["year"])
     same_year = data[data["year"] == year]
-    level = last[TARGET]
-    median = same_year[TARGET].median()
-    rank = int((same_year[TARGET] > level).sum()) + 1  # 1 — самый высокий уровень
+    level = last[target]
+    median = same_year[target].median()
+    rank = int((same_year[target] > level).sum()) + 1  # 1 — самый высокий уровень
 
     # --- 1. Уровень преступности ---
-    st.header(f"1. Уровень преступности в {year} году")
+    st.header(f"1. Уровень преступности в {year} году" + ("" if category == "Все преступления"
+                                                            else f": {CATEGORY_PHRASE[category]}"))
     c1, c2, c3 = st.columns(3)
     c1.metric("Преступлений на 100 тыс. жителей", num(level, 0),
               help="Число зарегистрированных преступлений в расчёте на 100 тысяч жителей региона. "
                    "Так можно сравнивать регионы с разной численностью населения.")
     c2.metric("Место среди регионов", f"{rank} из {len(same_year)}",
               help="1-е место — самый высокий уровень преступности, последнее — самый низкий.")
-    c3.metric(f"Изменение с {int(first['year'])} года", f"{(level / first[TARGET] - 1) * 100:+.0f} %".replace("-", "−"))
+    c3.metric(f"Изменение с {int(first['year'])} года", f"{(level / first[target] - 1) * 100:+.0f} %".replace("-", "−"))
     compare = "выше" if level > median else "ниже"
     st.markdown(f"Уровень преступности в регионе **{compare}** типичного для регионов России "
                 f"({num(median, 0)} на 100 тыс. жителей в {year} году).")
-    med_by_year = data.groupby("year")[TARGET].median()
-    chart = pd.DataFrame({"год": reg["year"].values, s_region: reg[TARGET].values,
+    med_by_year = data.groupby("year")[target].median()
+    chart = pd.DataFrame({"год": reg["year"].values, s_region: reg[target].values,
                           "типичный уровень по регионам": med_by_year.loc[reg["year"]].values})
     fig = px.line(chart.melt("год", var_name="ряд", value_name="преступлений на 100 тыс."),
                   x="год", y="преступлений на 100 тыс.", color="ряд", markers=True,
@@ -381,7 +420,7 @@ if mode == SIMPLE:
     if all(v == 0 for v in changes.values()):
         st.info("Сдвиньте один или несколько ползунков, чтобы увидеть результат.")
     else:
-        total, single = scenario_effects(s_features, s_method, s_params, s_split,
+        total, single = scenario_effects(s_features, s_method, s_params, s_split, target,
                                          tuple(changes[f] for f in s_features))
         new_level = level * (1 + total / 100)
         m1, m2 = st.columns(2)
@@ -410,8 +449,8 @@ if mode == SIMPLE:
 """)
 
     # --- 4. Точность ---
-    model_s, tr_s, te_s = train(s_features, s_method, s_params, s_split)
-    X_s, y_s = data[list(s_features)], data[TARGET]
+    model_s, tr_s, te_s = train(s_features, s_method, s_params, s_split, target)
+    X_s, y_s = data[list(s_features)], data[target]
     pred_s = model_s.predict(X_s.iloc[te_s])
     r2_s, mae_s = r2_score(y_s.iloc[te_s], pred_s), mean_absolute_error(y_s.iloc[te_s], pred_s)
     st.header("4. Насколько точны расчёты")
@@ -420,6 +459,10 @@ if mode == SIMPLE:
                 f"в среднем на **{num(mae_s, 0)}** преступлений на 100 тыс. жителей (около "
                 f"{mae_s / y_s.mean() * 100:.0f} % среднего уровня). Подробная проверка моделей — в режиме "
                 f"«{ADVANCED}».")
+    if r2_s < 0.8:
+        st.warning(f"Для показателя «{CATEGORY_PHRASE[category]}» модель описывает различия хуже, чем для всех преступлений "
+                   "(допустимый уровень точности — 80 %). Результаты сценария здесь следует считать грубыми. "
+                   "Причины — в режиме «Для аналитика», вкладка «Виды преступлений».")
     st.caption("Данные: Генпрокуратура и Росстат (обработка «Если быть точным»), переписи 2010 и 2020 гг. "
                "Данные о преступности по регионам доступны по 2022 год.")
     st.stop()
@@ -431,6 +474,9 @@ for key, value in {"degree": DEFAULTS["Полиномиальная регрес
     st.session_state.setdefault(key, value)
 
 st.sidebar.header("Настройки модели")
+
+category = st.sidebar.selectbox("Вид преступлений", list(CATEGORIES), key="category", help=CATEGORY_HELP)
+target = CATEGORIES[category][1]
 
 method = st.sidebar.selectbox("Метод", list(METHODS), index=len(METHODS) - 1, key="method",
                               help="Каким способом строится связь факторов с уровнем преступности.")
@@ -492,8 +538,8 @@ if method != "Линейная регрессия":
                       help="Перебирает параметры метода и ставит лучшие. Проверка идёт только на обучающих "
                            "данных, тестовые в подборе не участвуют.")
 
-model, tr, te = train(tuple(features), method, freeze(params), split_type)
-X, y = data[features], data[TARGET]
+model, tr, te = train(tuple(features), method, freeze(params), split_type, target)
+X, y = data[features], data[target]
 pred_tr, pred_te = model.predict(X.iloc[tr]), model.predict(X.iloc[te])
 r2_tr, r2_te = r2_score(y.iloc[tr], pred_tr), r2_score(y.iloc[te], pred_te)
 mae_te = mean_absolute_error(y.iloc[te], pred_te)
@@ -501,7 +547,8 @@ mae_te = mean_absolute_error(y.iloc[te], pred_te)
 # ---------- Заголовок ----------
 st.title("Влияние социально-экономических факторов на преступность в регионах РФ")
 st.caption("Данные: Генпрокуратура и Росстат (обработка «Если быть точным»), переписи 2010 и 2020 гг.; "
-           f"85 регионов, 2011–2022 гг., {len(data)} строк после очистки.")
+           f"85 регионов, 2011–2022 гг., {len(data)} строк после очистки. Показатель: **{CATEGORY_PHRASE[category]}** "
+           "на 100 тыс. жителей.")
 
 with st.expander("Что делает приложение и как его читать", expanded=False):
     st.markdown(f"""
@@ -522,7 +569,8 @@ with st.expander("Что делает приложение и как его чи
 - «Регион» — реальный уровень преступности в регионе по годам и оценка модели;
 - «Качество модели» — насколько точно выбранная модель угадывает спрятанные данные;
 - «Влияние факторов» — какие показатели важнее для модели и в какую сторону они тянут оценку;
-- «Что, если» — как изменится оценка модели, если изменить показатели региона.
+- «Что, если» — как изменится оценка модели, если изменить показатели региона;
+- «Виды преступлений» — точность моделей и роль факторов для разных видов преступлений.
 
 Модель показывает **связь** показателей с преступностью; причинность она не доказывает.
 """)
@@ -554,7 +602,7 @@ elif r2_tr - r2_te > 0.15:
                f"модель точнее, чем на новых, значит, часть данных она запомнила. Порог 0,15 взят из методических "
                f"правил работы.")
 
-if st.session_state.get("tune_for") == (tuple(features), method, split_type):
+if st.session_state.get("tune_for") == (tuple(features), method, split_type, target):
     with st.expander("Результат подбора параметров", expanded=True):
         st.write(f"Подбор для метода «{method}» и способа проверки «{split_type}». Каждая строка — вариант "
                  "параметров; «R² на проверке» — среднее по пяти проверкам внутри обучающей выборки (тестовые "
@@ -562,15 +610,15 @@ if st.session_state.get("tune_for") == (tuple(features), method, split_type):
                  "качество — «R² на тесте» выше.")
         st.dataframe(st.session_state.tune_table.head(10).round(3), hide_index=True, width="stretch")
 
-tab_compare, tab_region, tab_model, tab_factors, tab_whatif = st.tabs(
-    ["Сравнение методов", "Регион", "Качество модели", "Влияние факторов", "Что, если"])
+tab_compare, tab_region, tab_model, tab_factors, tab_whatif, tab_categories = st.tabs(
+    ["Сравнение методов", "Регион", "Качество модели", "Влияние факторов", "Что, если", "Виды преступлений"])
 
 # ---------- Вкладка: сравнение методов ----------
 with tab_compare:
     st.caption(f"Все методы обучены на одних и тех же данных ({len(features)} факторов, способ проверки "
                f"«{split_type}») с параметрами, подобранными перебором по сетке на обучающей выборке. "
                "Параметры выбранного слева метода можно менять и подбирать отдельно.")
-    table = compare_methods(tuple(features), split_type)
+    table = compare_methods(tuple(features), split_type, target)
     fig = px.bar(table.sort_values("R² на тесте"), x="R² на тесте", y="метод", orientation="h",
                  title="R² на тестовой выборке по методам", text_auto=".3f")
     fig.add_vline(x=0.85, line_dash="dash", line_color="grey")
@@ -586,6 +634,9 @@ with tab_compare:
 
     # --- Устойчивость результата: четыре способа проверки ---
     st.subheader("Насколько устойчив результат")
+    if category != "Все преступления":
+        st.info("Этот раздел относится ко всем преступлениям. Проверка гибридной модели для выбранного вида — "
+                "на вкладке «Виды преступлений».")
     st.markdown("Одно деление на обучающую и тестовую выборки может оказаться удачным или неудачным случайно. "
                 "Поэтому каждый метод проверен четырьмя способами (все 8 факторов, параметры подобраны на "
                 "обучающих данных):")
@@ -646,14 +697,14 @@ with tab_region:
                "модель описывает регион.")
     region = st.selectbox("Регион", regions, index=regions.index(DEMO_REGION))
     reg = data[data["region"] == region].sort_values("year")
-    chart = pd.DataFrame({"год": reg["year"], "факт": reg[TARGET].values, "модель": model.predict(reg[features])})
+    chart = pd.DataFrame({"год": reg["year"], "факт": reg[target].values, "модель": model.predict(reg[features])})
     fig = px.line(chart.melt("год", var_name="ряд", value_name="преступлений на 100 тыс."),
                   x="год", y="преступлений на 100 тыс.", color="ряд", markers=True,
                   title=f"{region}: уровень преступности, факт и оценка модели")
     st.plotly_chart(fig, width="stretch")
     st.caption("Таблица: показатели региона по годам, на которых модель строит оценку.")
-    st.dataframe(reg[["year", TARGET] + features].rename(
-        columns={"year": "год", TARGET: "преступлений на 100 тыс.", **FEATURE_NAMES}).round(2),
+    st.dataframe(reg[["year", target] + features].rename(
+        columns={"year": "год", target: "преступлений на 100 тыс.", **FEATURE_NAMES}).round(2),
         hide_index=True, width="stretch")
 
 # ---------- Вкладка: качество модели ----------
@@ -686,7 +737,7 @@ with tab_model:
             key, values, label = curve
             rows = []
             for v in values:
-                m, _, _ = train(tuple(features), method, freeze({**params, key: v}), split_type)
+                m, _, _ = train(tuple(features), method, freeze({**params, key: v}), split_type, target)
                 rows += [{label: v, "выборка": "обучение", "R²": r2_score(y.iloc[tr], m.predict(X.iloc[tr]))},
                          {label: v, "выборка": "тест", "R²": max(r2_score(y.iloc[te], m.predict(X.iloc[te])), -1)}]
             fig = px.line(pd.DataFrame(rows), x=label, y="R²", color="выборка", markers=True,
@@ -706,7 +757,7 @@ with tab_model:
 
 # ---------- Вкладка: влияние факторов ----------
 with tab_factors:
-    effects = factor_effects(tuple(features), method, freeze(params), split_type)
+    effects = factor_effects(tuple(features), method, freeze(params), split_type, target)
     left, right = st.columns(2)
     with left:
         fig = px.bar(effects.sort_values("важность"), x="важность", y="фактор", orientation="h",
@@ -757,13 +808,13 @@ with tab_whatif:
                    + ". Модель таких регионов не видела, её оценка здесь ненадёжна.")
 
     changes = tuple(int(st.session_state[f"s_{f}"]) for f in features)
-    fact = row[TARGET].iloc[0]
+    fact = row[target].iloc[0]
     base_pred, new_pred = model.predict(base)[0], model.predict(scenario)[0]
     m1, m2, m3 = st.columns(3)
     m1.metric("Факт", f"{fact:.0f}",
               help="Реальный уровень преступности в регионе в выбранном году, на 100 тыс. жителей.")
     if any(changes):
-        total, single = scenario_effects(tuple(features), method, freeze(params), split_type, changes)
+        total, single = scenario_effects(tuple(features), method, freeze(params), split_type, target, changes)
         new_avg = fact * (1 + total / 100)
         m2.metric("Оценка по сценарию", f"{new_avg:.0f}", delta=f"{new_avg - fact:+.0f} ({total:+.1f} %)",
                   delta_color="inverse",
@@ -786,3 +837,73 @@ with tab_whatif:
                + WAGE_NOTE)
     st.caption("Все значения — преступлений на 100 тыс. жителей. Оценки ориентировочные: модель показывает "
                "связь показателей с преступностью, причинность она не доказывает.")
+
+# ---------- Вкладка: виды преступлений ----------
+with tab_categories:
+    st.markdown("Одинаково ли социально-экономические условия связаны с разными видами преступлений? Для каждого "
+                "вида гибридная модель обучена отдельно (8 факторов, параметры подобраны на обучающих данных) и "
+                "проверена теми же способами, что и для всех преступлений. Результаты рассчитаны заранее.")
+    cat_cmp, cat_fac = load_categories()
+    key_to_name = {v[0]: k for k, v in CATEGORIES.items()}
+    cat_cmp["вид"] = list(CATEGORIES)  # порядок строк в таблице ноутбука 07 совпадает с CATEGORIES
+    checks = {"R² тест 70/30": "случайно 70/30", "R² 5 частей": "перекрёстная, 5 частей", "R² по годам": "по годам",
+              "R² по регионам": "по регионам"}
+    long = cat_cmp.melt(id_vars=["вид"], value_vars=list(checks), var_name="проверка", value_name="R²")
+    long["проверка"] = long["проверка"].map(checks)
+    long["значение"] = long["R²"].map(lambda v: num(v, 3))
+    long["R² на графике"] = long["R²"].clip(lower=0)
+    fig = px.scatter(long, x="R² на графике", y="вид", color="проверка",
+                     category_orders={"вид": list(CATEGORIES), "проверка": list(checks.values())},
+                     color_discrete_sequence=[ACCENT, SECOND, "#199E70", "#8A6FE0"],
+                     hover_data={"значение": True, "R² на графике": False},
+                     title="Точность гибридной модели по видам преступлений")
+    fig.update_traces(marker=dict(size=11, line=dict(width=1, color="white")))
+    fig.add_vline(x=0.85, line_dash="dash", line_color="grey", annotation_text="ориентир 0,85",
+                  annotation_position="top left")
+    fig.add_vline(x=0.8, line_dash="dot", line_color="grey")
+    fig.update_layout(xaxis_range=[-0.03, 1.0], xaxis_title="R² на проверочных данных", yaxis_title="",
+                      legend_title="способ проверки", height=430)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Значения ниже 0 показаны у левого края; точные значения — при наведении и в таблице ниже.")
+    shown = cat_cmp[["вид", "R² тест 70/30", "средняя ошибка", "средняя ошибка, % среднего", "R² 5 частей",
+                     "R² по годам", "R² по регионам", "R² линейная 70/30", "R² 70/30 без доли нераскрытых"]]
+    st.dataframe(shown.round(3), hide_index=True, width="stretch")
+    econ = cat_cmp.set_index("вид").loc["Экономической направленности"]
+    st.markdown(f"**Вывод.** Для всех преступлений, преступлений небольшой и средней тяжести и убийств модель "
+                f"достигает ориентира 0,85, для тяжких преступлений — допустимого уровня 0,8. Хуже всего описываются "
+                f"экономические преступления (R² = {num(econ['R² тест 70/30'], 2)}): их уровень за 2011–2022 гг. "
+                f"снизился почти вдвое во всех регионах сразу, а различия между регионами объясняют только треть "
+                f"разброса. Такие общие для страны изменения связаны с выявлением и учётом этих преступлений, "
+                f"и условия отдельного региона их не описывают.")
+
+    st.subheader("Роль факторов по видам преступлений")
+    short = ["Все", "Тяжкие и<br>особо тяжкие", "Небольшой<br>и средней тяжести", "Экономические", "Наркотики",
+             "Убийства"]
+    imp = cat_fac[[f"важность_{v[0]}" for v in CATEGORIES.values()]]
+    imp.columns, imp.index = short, [FEATURE_NAMES[f] for f in imp.index]
+    eff = cat_fac[[f"эффект_{v[0]}" for v in CATEGORIES.values()]]
+    eff.columns, eff.index = short, [FEATURE_NAMES[f] for f in eff.index]
+    fig = px.imshow(imp.round(0), text_auto=True, aspect="auto", color_continuous_scale="Blues",
+                    title="Доля фактора в важности модели, %")
+    fig.update_layout(coloraxis_showscale=False, xaxis_title="", yaxis_title="", height=360,
+                      margin=dict(t=110, b=10))
+    fig.update_xaxes(side="top", tickangle=0)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Важность — насколько падает точность модели, если значения фактора перемешать. В каждом столбце "
+               "сумма равна 100 %: так виды с разной точностью можно сравнивать.")
+    fig = px.imshow(eff.round(1), text_auto=True, aspect="auto", color_continuous_scale="RdBu_r",
+                    color_continuous_midpoint=0, zmin=-6, zmax=6,
+                    title="Изменение средней оценки модели при росте фактора на 10 %, %")
+    fig.update_layout(coloraxis_showscale=False, xaxis_title="", yaxis_title="", height=360,
+                      margin=dict(t=110, b=10))
+    fig.update_xaxes(side="top", tickangle=0)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Красный — оценка растёт, синий — снижается. Для миграционного прироста рост на 10 % у регионов "
+               "с оттоком населения означает усиление оттока.")
+    st.markdown("**Что различается.** Зарплата относительно других регионов — самый важный фактор для всех видов, "
+                "кроме экономических; сильнее всего её связь с убийствами. Доля людей с высшим образованием связана "
+                "со снижением почти всех видов, сильнее всего — убийств. Доля бедных связана с ростом преступлений "
+                "небольшой и средней тяжести, связанных с наркотиками, и убийств и почти не связана с тяжкими. "
+                "Для экономических преступлений главный фактор — число студентов: их больше в крупных экономических "
+                "центрах, где выше и хозяйственная активность.")
+    st.caption("Доля нераскрытых во всех моделях — общая по всем преступлениям. Расчёт: ноутбук 07.")
