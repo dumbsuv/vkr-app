@@ -1,0 +1,29 @@
+{
+  "base": [
+    "unemployment",
+    "wage_rel",
+    "poverty",
+    "urban",
+    "migration",
+    "students",
+    "higher_edu_share"
+  ],
+  "control": [
+    "unsolved_share"
+  ],
+  "excluded": {
+    "income_rel": "дублирует зарплату (r = 0,93, VIF 17,7)",
+    "grp_rel": "не добавляет точности ни одной модели; повторяет зарплату (r = 0,73)",
+    "alcohol": "данные только за отдельные годы (ноутбук 03)"
+  },
+  "names": {
+    "unemployment": "Безработица, %",
+    "wage_rel": "Зарплата к медиане",
+    "poverty": "Доля бедных, %",
+    "urban": "Городское население, %",
+    "migration": "Миграционный прирост на 10 тыс.",
+    "students": "Студенты вузов на 10 тыс.",
+    "higher_edu_share": "С высшим образованием, %",
+    "unsolved_share": "Доля нераскрытых, %"
+  }
+}
