@@ -127,6 +127,9 @@ def freeze(p):
     return tuple(sorted(p.items()))
 
 
+num = lambda v, d: f"{v:,.{d}f}".replace(",", " ").replace(".", ",")  # 12 345,67
+
+
 @st.cache_resource
 def train(features, method, params, split_type):
     """Обучает модель; результат запоминается, чтобы не переобучать при каждом клике."""
@@ -221,6 +224,190 @@ def on_tune():
     st.session_state.tune_for = (tuple(current_features()), method, split_type)
 
 
+# ---------- Сценарий «что, если» по усреднённой зависимости ----------
+# Показатели в процентах не могут превысить 100
+PERCENT_FEATURES = [f for f, name in FEATURE_NAMES.items() if name.endswith("%")]
+
+
+@st.cache_data
+def scenario_effects(features, method, params, split_type, changes):
+    """Как в среднем меняется оценка модели, если изменить факторы на заданные проценты.
+
+    changes — изменения факторов в процентах (в том же порядке, что features).
+    Шаг 1: все строки тестовой выборки сдвигаются на одни и те же проценты.
+    Шаг 2: сравнивается средняя оценка модели до и после сдвига.
+    Усреднение по многим регионам сглаживает ступенчатый отклик леса и kNN в отдельной точке.
+    Возвращает общее изменение в процентах и изменение от каждого фактора по отдельности."""
+    model, tr, te = train(features, method, params, split_type)
+    X_te = data.loc[te, list(features)]
+    base = model.predict(X_te).mean()
+    changes = np.array(changes, dtype=float)
+    # Первый сценарий — все изменения сразу, дальше — каждое изменение отдельно
+    scenarios = [changes] + [np.where(np.arange(len(features)) == i, c, 0.0) for i, c in enumerate(changes)]
+    frames = []
+    for ch in scenarios:
+        shifted = X_te * (1 + ch / 100)
+        for f in features:
+            if f in PERCENT_FEATURES:
+                shifted[f] = shifted[f].clip(upper=100)
+        frames.append(shifted)
+    pred = model.predict(pd.concat(frames)).reshape(len(scenarios), len(X_te)).mean(axis=1)
+    rel = (pred / base - 1) * 100
+    return float(rel[0]), dict(zip(features, rel[1:].tolist()))
+
+
+def effects_chart(single, features):
+    """Столбцы: на сколько процентов меняется уровень преступности от каждого изменения по отдельности."""
+    eff = pd.DataFrame({"фактор": [FEATURE_NAMES[f] for f in features], "изменение, %": [single[f] for f in features]})
+    eff = eff[eff["изменение, %"].abs() > 0.05].sort_values("изменение, %")
+    eff["направление"] = np.where(eff["изменение, %"] > 0, "преступность выше", "преступность ниже")
+    fig = px.bar(eff, x="изменение, %", y="фактор", color="направление", orientation="h", text_auto=".1f",
+                 color_discrete_map={"преступность выше": "#d62728", "преступность ниже": "#2ca02c"},
+                 title="Вклад каждого изменения по отдельности")
+    fig.update_layout(yaxis_title="", xaxis_title="изменение уровня преступности, %", legend_title="",
+                      height=160 + 60 * len(eff))
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    return fig
+
+
+WAGE_NOTE = ("Почему рост зарплаты связан с ростом преступности. Самые высокие зарплаты относительно других "
+             "регионов — на Севере и Дальнем Востоке (Чукотский АО, Ямало-Ненецкий АО, Магаданская область, "
+             "Камчатский край, Сахалинская область), и уровень преступности там в основном выше типичного. "
+             "Модель отражает эту связь в данных; из неё не следует, что повышение зарплат вызывает рост "
+             "преступности.")
+
+# ---------- Режим работы ----------
+SIMPLE, ADVANCED = "Для органов власти", "Для аналитика"
+mode = st.radio("Режим", [SIMPLE, ADVANCED], horizontal=True, key="mode", label_visibility="collapsed",
+                help="«Для органов власти» — обзор региона и сценарии без технических настроек. "
+                     "«Для аналитика» — выбор метода, настройки и проверка качества моделей.")
+regions = sorted(data["region"].unique())
+
+if mode == SIMPLE:
+    # Модель для простого режима зафиксирована: гибридная, все факторы, параметры из ноутбука 06
+    s_features = tuple(BASE + CONTROL)
+    s_method = "Гибридная модель (лес + kNN)"
+    s_params = freeze(DEFAULTS[s_method])
+    s_split = SPLITS[0]
+
+    st.title("Преступность в регионах России и социально-экономические условия")
+    st.markdown("Здесь можно посмотреть уровень преступности в регионе, сравнить регион с остальными и оценить, "
+                "как с уровнем преступности связаны занятость, доходы, образование и другие условия. "
+                f"Расчёты основаны на данных по 85 регионам за {data['year'].min()}–{data['year'].max()} гг.")
+
+    s_region = st.selectbox("Выберите регион", regions, index=regions.index(DEMO_REGION), key="s_region")
+    reg = data[data["region"] == s_region].sort_values("year")
+    last, first = reg.iloc[-1], reg.iloc[0]
+    year = int(last["year"])
+    same_year = data[data["year"] == year]
+    level = last[TARGET]
+    median = same_year[TARGET].median()
+    rank = int((same_year[TARGET] > level).sum()) + 1  # 1 — самый высокий уровень
+
+    # --- 1. Уровень преступности ---
+    st.header(f"1. Уровень преступности в {year} году")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Преступлений на 100 тыс. жителей", num(level, 0),
+              help="Число зарегистрированных преступлений в расчёте на 100 тысяч жителей региона. "
+                   "Так можно сравнивать регионы с разной численностью населения.")
+    c2.metric("Место среди регионов", f"{rank} из {len(same_year)}",
+              help="1-е место — самый высокий уровень преступности, последнее — самый низкий.")
+    c3.metric(f"Изменение с {int(first['year'])} года", f"{(level / first[TARGET] - 1) * 100:+.0f} %".replace("-", "−"))
+    compare = "выше" if level > median else "ниже"
+    st.markdown(f"Уровень преступности в регионе **{compare}** типичного для регионов России "
+                f"({num(median, 0)} на 100 тыс. жителей в {year} году).")
+    med_by_year = data.groupby("year")[TARGET].median()
+    chart = pd.DataFrame({"год": reg["year"].values, s_region: reg[TARGET].values,
+                          "типичный уровень по регионам": med_by_year.loc[reg["year"]].values})
+    fig = px.line(chart.melt("год", var_name="ряд", value_name="преступлений на 100 тыс."),
+                  x="год", y="преступлений на 100 тыс.", color="ряд", markers=True,
+                  title="Уровень преступности по годам")
+    fig.update_layout(legend_title="", yaxis_rangemode="tozero")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Типичный уровень — медиана: у половины регионов уровень выше, у половины ниже.")
+
+    # --- 2. Показатели региона ---
+    st.header("2. Условия в регионе по сравнению с другими регионами")
+    rows = []
+    for f in s_features:
+        value = last[f]
+        share = (same_year[f] < value).mean() * 100
+        rows.append({"показатель": FEATURE_NAMES[f], "в регионе": num(value, 2),
+                     "типичное значение": num(same_year[f].median(), 2),
+                     "положение": f"выше, чем у {share:.0f} % регионов"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(f"Данные за {year} год. «Зарплата к медиане»: 1 — типичная зарплата для регионов в этом году, "
+               "1,5 — в полтора раза выше типичной. Типичное значение — медиана по регионам.")
+
+    # --- 3. Что, если ---
+    st.header("3. Что, если изменить условия")
+    st.markdown("Передвиньте ползунки: на сколько процентов изменится показатель. Расчёт покажет, как такое "
+                "изменение в среднем связано с уровнем преступности в регионах России, и применит это к "
+                "выбранному региону.")
+
+    def reset_sliders():
+        for f in s_features:
+            st.session_state[f"p_{f}"] = 0
+
+    groups = {"Экономика": ["unemployment", "wage_rel", "poverty"],
+              "Население и образование": ["urban", "migration", "students", "higher_edu_share"],
+              "Работа правоохранительных органов": ["unsolved_share"]}
+    changes = {}
+    for col, (title, group) in zip(st.columns(3), groups.items()):
+        col.markdown(f"**{title}**")
+        for f in group:
+            hint = ("Значение отрицательное: из региона уезжает больше людей, чем приезжает. Рост на 10 % "
+                    "означает, что отток усилится на 10 %." if last[f] < 0 else None)
+            changes[f] = col.slider(f"{FEATURE_NAMES[f]}, сейчас {num(last[f], 2)}", -30, 30, 0, step=5,
+                                    key=f"p_{f}", format="%d %%", help=hint)
+    st.button("Вернуть все ползунки к нулю", on_click=reset_sliders)
+
+    if all(v == 0 for v in changes.values()):
+        st.info("Сдвиньте один или несколько ползунков, чтобы увидеть результат.")
+    else:
+        total, single = scenario_effects(s_features, s_method, s_params, s_split,
+                                         tuple(changes[f] for f in s_features))
+        new_level = level * (1 + total / 100)
+        m1, m2 = st.columns(2)
+        m1.metric(f"Сейчас ({year})", num(level, 0))
+        m2.metric("По сценарию", num(new_level, 0), delta=f"{num(new_level - level, 0)} ({total:+.1f} %)",
+                  delta_color="inverse")
+        direction = "снизиться" if total < 0 else "вырасти"
+        st.markdown(f"При заданных изменениях уровень преступности в регионе может **{direction} примерно на "
+                    f"{num(abs(total), 1)} %**: с {num(level, 0)} до {num(new_level, 0)} преступлений на "
+                    "100 тыс. жителей.")
+        st.plotly_chart(effects_chart(single, s_features), width="stretch")
+        scenario_values = {f: last[f] * (1 + changes[f] / 100) for f in s_features}
+        outside = [FEATURE_NAMES[f] for f in s_features
+                   if not data[f].min() <= scenario_values[f] <= data[f].max()]
+        if outside:
+            st.warning("Значения выходят за пределы того, что встречалось в регионах России за 2011–2022 гг.: "
+                       + ", ".join(outside) + ". Для таких значений расчёт ненадёжен.")
+    with st.expander("Как читать результат"):
+        st.markdown(f"""
+- Расчёт показывает **связь** условий жизни с уровнем преступности по данным всех регионов. Он не доказывает,
+  что изменение показателя само по себе изменит уровень преступности: на преступность влияют и другие причины.
+- Изменение считается так: у всех регионов из проверочной части данных показатели сдвигаются на выбранные
+  проценты, и сравнивается средний уровень преступности, который вычисляет модель, до и после сдвига.
+  Полученный процент применяется к выбранному региону.
+- {WAGE_NOTE}
+""")
+
+    # --- 4. Точность ---
+    model_s, tr_s, te_s = train(s_features, s_method, s_params, s_split)
+    X_s, y_s = data[list(s_features)], data[TARGET]
+    pred_s = model_s.predict(X_s.iloc[te_s])
+    r2_s, mae_s = r2_score(y_s.iloc[te_s], pred_s), mean_absolute_error(y_s.iloc[te_s], pred_s)
+    st.header("4. Насколько точны расчёты")
+    st.markdown(f"Модель проверена на данных, которые не использовались при её построении. Она объясняет около "
+                f"**{r2_s * 100:.0f} %** различий в уровне преступности между регионами и годами и ошибается "
+                f"в среднем на **{num(mae_s, 0)}** преступлений на 100 тыс. жителей (около "
+                f"{mae_s / y_s.mean() * 100:.0f} % среднего уровня). Подробная проверка моделей — в режиме "
+                f"«{ADVANCED}».")
+    st.caption("Данные: Генпрокуратура и Росстат (обработка «Если быть точным»), переписи 2010 и 2020 гг. "
+               "Данные о преступности по регионам доступны по 2022 год.")
+    st.stop()
+
 # ---------- Боковая панель ----------
 for key, value in {"degree": DEFAULTS["Полиномиальная регрессия"]["degree"], "alpha": 10, "k": KNN_P["k"],
                    "trees": RF_P["trees"], "use_ridge": True, "knn_distance": KNN_P["weights"] == "distance",
@@ -293,7 +480,6 @@ X, y = data[features], data[TARGET]
 pred_tr, pred_te = model.predict(X.iloc[tr]), model.predict(X.iloc[te])
 r2_tr, r2_te = r2_score(y.iloc[tr], pred_tr), r2_score(y.iloc[te], pred_te)
 mae_te = mean_absolute_error(y.iloc[te], pred_te)
-num = lambda v, d: f"{v:,.{d}f}".replace(",", " ").replace(".", ",")  # 12 345,67
 
 # ---------- Заголовок ----------
 st.title("Влияние социально-экономических факторов на преступность в регионах РФ")
@@ -382,7 +568,6 @@ with tab_compare:
                "любых данных; для этого метода показателен только R² на тесте.")
 
 # ---------- Вкладка: регион ----------
-regions = sorted(data["region"].unique())
 with tab_region:
     st.caption("Две линии по годам для выбранного региона: **факт** — реальный уровень преступности, "
                "**модель** — оценка модели по показателям региона в этом году. Чем ближе линии, тем лучше "
@@ -499,16 +684,33 @@ with tab_whatif:
         st.warning("Значения вышли за пределы того, что встречалось в обучающих данных: " + ", ".join(outside)
                    + ". Модель таких регионов не видела, её оценка здесь ненадёжна.")
 
+    changes = tuple(int(st.session_state[f"s_{f}"]) for f in features)
+    fact = row[TARGET].iloc[0]
     base_pred, new_pred = model.predict(base)[0], model.predict(scenario)[0]
     m1, m2, m3 = st.columns(3)
-    m1.metric("Факт", f"{row[TARGET].iloc[0]:.0f}",
+    m1.metric("Факт", f"{fact:.0f}",
               help="Реальный уровень преступности в регионе в выбранном году, на 100 тыс. жителей.")
-    m2.metric("Оценка модели при реальных показателях", f"{base_pred:.0f}",
-              help="Что модель вычисляет по реальным показателям региона в этом году. Разница с фактом — "
-                   "ошибка модели для этого региона.")
-    m3.metric("Оценка модели по сценарию", f"{new_pred:.0f}", delta=f"{new_pred - base_pred:+.0f}",
+    if any(changes):
+        total, single = scenario_effects(tuple(features), method, freeze(params), split_type, changes)
+        new_avg = fact * (1 + total / 100)
+        m2.metric("Оценка по сценарию", f"{new_avg:.0f}", delta=f"{new_avg - fact:+.0f} ({total:+.1f} %)",
+                  delta_color="inverse",
+                  help="Основная оценка. Все строки тестовой выборки сдвигаются на выбранные проценты; "
+                       "относительное изменение средней оценки модели применяется к факту региона.")
+    else:
+        m2.metric("Оценка по сценарию", f"{fact:.0f}", help="Сдвиньте ползунки, чтобы получить сценарий.")
+    m3.metric("Оценка модели в точке", f"{new_pred:.0f}", delta=f"{new_pred - base_pred:+.0f}",
               delta_color="inverse",
-              help="Что модель вычисляет с изменёнными показателями. Стрелка — разница с оценкой при реальных "
-                   "показателях (красный — больше преступлений, зелёный — меньше).")
+              help=f"Справочно: оценка модели для одной строки с изменёнными показателями; при реальных "
+                   f"показателях — {base_pred:.0f}. У леса и kNN отклик в одной точке ступенчатый: оценка "
+                   f"берётся по похожим строкам обучающей выборки, и при любом сдвиге похожими становятся "
+                   f"другие регионы и годы.")
+    if any(changes):
+        st.plotly_chart(effects_chart(single, features), width="stretch")
+    st.caption("Почему основная оценка считается по всей тестовой выборке. Лес и kNN оценивают уровень по похожим "
+               "строкам обучающих данных, поэтому их отклик в одной точке ступенчатый и может расти при сдвиге "
+               "фактора в любую сторону (особенно если строка сама есть в обучающих данных). Усреднение по "
+               "многим регионам сглаживает ступеньки и показывает устойчивое направление связи. "
+               + WAGE_NOTE)
     st.caption("Все значения — преступлений на 100 тыс. жителей. Оценки ориентировочные: модель показывает "
                "связь показателей с преступностью, причинность она не доказывает.")
