@@ -56,6 +56,13 @@ METHODS = {
 
 st.set_page_config(page_title="Факторы преступности в регионах РФ", layout="wide")
 
+# Цвета графиков. Акцентный синий совпадает с цветом элементов (файл .streamlit/config.toml);
+# оранжевый — второй ряд. Пара проверена на различимость при нарушениях цветового зрения,
+# на белом и на тёмном фоне. Красный и зелёный оставлены только для смысла «выше» и «ниже».
+ACCENT, SECOND, NEUTRAL = "#2F74E0", "#DD6B1F", "#8A8F98"
+UP, DOWN = "#D03B3B", "#2F9E44"
+px.defaults.color_discrete_sequence = [ACCENT, SECOND]
+
 
 # ---------- Данные ----------
 @st.cache_data
@@ -262,7 +269,7 @@ def effects_chart(single, features):
     eff = eff[eff["изменение, %"].abs() > 0.05].sort_values("изменение, %")
     eff["направление"] = np.where(eff["изменение, %"] > 0, "преступность выше", "преступность ниже")
     fig = px.bar(eff, x="изменение, %", y="фактор", color="направление", orientation="h", text_auto=".1f",
-                 color_discrete_map={"преступность выше": "#d62728", "преступность ниже": "#2ca02c"},
+                 color_discrete_map={"преступность выше": UP, "преступность ниже": DOWN},
                  title="Вклад каждого изменения по отдельности")
     fig.update_layout(yaxis_title="", xaxis_title="изменение уровня преступности, %", legend_title="",
                       height=160 + 60 * len(eff))
@@ -321,7 +328,8 @@ if mode == SIMPLE:
                           "типичный уровень по регионам": med_by_year.loc[reg["year"]].values})
     fig = px.line(chart.melt("год", var_name="ряд", value_name="преступлений на 100 тыс."),
                   x="год", y="преступлений на 100 тыс.", color="ряд", markers=True,
-                  title="Уровень преступности по годам")
+                  title="Уровень преступности по годам",
+                  color_discrete_map={s_region: ACCENT, "типичный уровень по регионам": NEUTRAL})
     fig.update_layout(legend_title="", yaxis_rangemode="tozero")
     st.plotly_chart(fig, width="stretch")
     st.caption("Типичный уровень — медиана: у половины регионов уровень выше, у половины ниже.")
@@ -621,13 +629,13 @@ with tab_model:
                           title=f"R² при разных значениях: {label}", log_x=(key == "alpha"))
             fig.add_hline(y=0.85, line_dash="dash", line_color="grey", annotation_text="ориентир 0,85")
             # на логарифмической оси положение линии задаётся в логарифмах
-            fig.add_vline(x=np.log10(params[key]) if key == "alpha" else params[key], line_color="orange")
+            fig.add_vline(x=np.log10(params[key]) if key == "alpha" else params[key], line_color=ACCENT)
             fig.update_yaxes(range=[-1.05, 1.05])
             st.plotly_chart(fig, width="stretch")
             st.caption("Как меняется качество, если менять главный параметр метода при остальных настройках. "
                        "Линия «обучение» показывает, насколько модель подстраивается под знакомые данные; линия "
                        "«тест» — насколько она угадывает новые. Если «обучение» растёт, а «тест» падает, это "
-                       "переобучение. Оранжевая вертикаль — текущее значение, пунктир — ориентир 0,85. "
+                       "переобучение. Синяя вертикаль — текущее значение, пунктир — ориентир 0,85. "
                        "Значения ниже −1 показаны как −1.")
         else:
             st.info("У линейной регрессии нет параметров для настройки.")
@@ -648,7 +656,7 @@ with tab_factors:
         eff = effects.sort_values("эффект +10 %")
         eff["направление"] = np.where(eff["эффект +10 %"] > 0, "оценка растёт", "оценка снижается")
         fig = px.bar(eff, x="эффект +10 %", y="фактор", color="направление", orientation="h",
-                     color_discrete_map={"оценка растёт": "#d62728", "оценка снижается": "#2ca02c"},
+                     color_discrete_map={"оценка растёт": UP, "оценка снижается": DOWN},
                      title="Что будет с оценкой, если фактор вырастет на 10 %")
         fig.update_layout(yaxis_title="", xaxis_title="изменение, преступлений на 100 тыс.")
         st.plotly_chart(fig, width="stretch")
