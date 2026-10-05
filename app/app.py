@@ -26,6 +26,7 @@ from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT / "data" / "processed" / "panel.csv"
 FEATURES_PATH = ROOT / "data" / "processed" / "features.json"
+PARAMS_PATH = ROOT / "data" / "processed" / "final_params.json"  # параметры, подобранные в ноутбуке 06
 TARGET = "crime_rate"
 
 FEATURES_INFO = json.loads(FEATURES_PATH.read_text(encoding="utf-8"))
@@ -77,29 +78,36 @@ def make_model(method, p):
     if method == "Ridge":
         return scaled(Ridge(alpha=p["alpha"]))
     if method == "ElasticNet":
-        return scaled(ElasticNet(alpha=p["alpha"], l1_ratio=0.5, max_iter=50000))
+        return scaled(ElasticNet(alpha=p["alpha"], l1_ratio=p.get("l1_ratio", 0.5), max_iter=50000))
     if method == "Полиномиальная регрессия":
         final = Ridge(alpha=p["alpha"]) if p["use_ridge"] else LinearRegression()
         return make_pipeline(StandardScaler(), PolynomialFeatures(p["degree"], include_bias=False),
                              StandardScaler(), final)
+    knn = lambda: scaled(KNeighborsRegressor(n_neighbors=p["k"], weights=p.get("weights", "uniform")))
+    forest = lambda: RandomForestRegressor(n_estimators=p["trees"], max_features=p.get("max_features", 1.0),
+                                           random_state=1, n_jobs=-1)
     if method == "k ближайших соседей (kNN)":
-        return scaled(KNeighborsRegressor(n_neighbors=p["k"]))
+        return knn()
     if method == "Гибридная модель (лес + kNN)":
-        return VotingRegressor([("лес", RandomForestRegressor(n_estimators=p["trees"], random_state=1, n_jobs=-1)),
-                                ("kNN", scaled(KNeighborsRegressor(n_neighbors=p["k"])))])
-    return RandomForestRegressor(n_estimators=p["trees"], random_state=1, n_jobs=-1)
+        return VotingRegressor([("лес", forest()), ("kNN", knn())])
+    return forest()
 
 
-# Параметры по умолчанию для вкладки «Сравнение методов» (начальные значения из плана, файл 03)
+# Параметры для вкладки «Сравнение методов»: подобраны в ноутбуке 06 перебором по сетке
+# с перекрёстной проверкой на обучающей выборке (70 %)
+FINAL = json.loads(PARAMS_PATH.read_text(encoding="utf-8"))
+KNN_P = {"k": FINAL["k ближайших соседей"]["n_neighbors"], "weights": FINAL["k ближайших соседей"]["weights"]}
+RF_P = {"trees": FINAL["Случайный лес"]["n_estimators"], "max_features": FINAL["Случайный лес"]["max_features"]}
 DEFAULTS = {
     "Линейная регрессия": {},
-    "Lasso": {"alpha": 0.1},
-    "Ridge": {"alpha": 1},
-    "ElasticNet": {"alpha": 0.1},
-    "Полиномиальная регрессия": {"degree": 2, "use_ridge": True, "alpha": 10},
-    "k ближайших соседей (kNN)": {"k": 5},
-    "Случайный лес": {"trees": 300},
-    "Гибридная модель (лес + kNN)": {"k": 5, "trees": 300},
+    "Lasso": {"alpha": FINAL["Lasso"]["alpha"]},
+    "Ridge": {"alpha": FINAL["Ridge"]["alpha"]},
+    "ElasticNet": {"alpha": FINAL["ElasticNet"]["alpha"], "l1_ratio": FINAL["ElasticNet"]["l1_ratio"]},
+    "Полиномиальная регрессия": {"degree": FINAL["Полиномиальная регрессия"]["degree"], "use_ridge": True,
+                                 "alpha": FINAL["Полиномиальная регрессия"]["alpha"]},
+    "k ближайших соседей (kNN)": KNN_P,
+    "Случайный лес": RF_P,
+    "Гибридная модель (лес + kNN)": {**KNN_P, **RF_P},
 }
 
 
@@ -165,9 +173,11 @@ GRIDS = {
     "Ridge": [{"alpha": a} for a in ALPHAS],
     "ElasticNet": [{"alpha": a} for a in ALPHAS],
     "Полиномиальная регрессия": [{"degree": d, "use_ridge": True, "alpha": a} for d in range(1, 5) for a in ALPHAS],
-    "k ближайших соседей (kNN)": [{"k": k} for k in [1, 3, 5, 7, 10, 15, 20, 30]],
-    "Случайный лес": [{"trees": t} for t in [50, 100, 300, 500]],
-    "Гибридная модель (лес + kNN)": [{"k": k, "trees": t} for k in [3, 5, 7, 10] for t in [100, 300]],
+    "k ближайших соседей (kNN)": [{"k": k, "weights": w} for k in [1, 2, 3, 5, 7, 10, 15]
+                                  for w in ["uniform", "distance"]],
+    "Случайный лес": [{"trees": 300, "max_features": m} for m in [0.33, 0.66, 1.0]],
+    "Гибридная модель (лес + kNN)": [{"k": k, "weights": "distance", "trees": 300, "max_features": m}
+                                     for k in [2, 3, 5] for m in [0.33, 0.66, 1.0]],
 }
 
 
@@ -199,6 +209,10 @@ def on_tune():
     for key in ["degree", "k", "trees"]:
         if key in best and not pd.isna(best[key]):
             st.session_state[key] = int(best[key])
+    if "weights" in best and not pd.isna(best["weights"]):
+        st.session_state.knn_distance = best["weights"] == "distance"
+    if "max_features" in best and not pd.isna(best["max_features"]):
+        st.session_state.max_features = float(best["max_features"])
     if "alpha" in best and not pd.isna(best["alpha"]):
         st.session_state.alpha = min(ALPHAS, key=lambda a: abs(a - float(best["alpha"])))
     if method == "Полиномиальная регрессия":
@@ -208,7 +222,9 @@ def on_tune():
 
 
 # ---------- Боковая панель ----------
-for key, value in {"degree": 2, "alpha": 10, "k": 5, "trees": 300, "use_ridge": True}.items():
+for key, value in {"degree": DEFAULTS["Полиномиальная регрессия"]["degree"], "alpha": 10, "k": KNN_P["k"],
+                   "trees": RF_P["trees"], "use_ridge": True, "knn_distance": KNN_P["weights"] == "distance",
+                   "max_features": RF_P["max_features"]}.items():
     st.session_state.setdefault(key, value)
 
 st.sidebar.header("Настройки модели")
@@ -249,10 +265,17 @@ if method in ("k ближайших соседей (kNN)", "Гибридная �
         "Число соседей k", 1, 30, key="k",
         help="Сколько самых похожих строк усреднять. Мало соседей — модель повторяет отдельные строки и "
              "переобучается; много — оценки сглаживаются и становятся грубее.")
+if method in ("k ближайших соседей (kNN)", "Гибридная модель (лес + kNN)"):
+    params["weights"] = "distance" if st.sidebar.checkbox(
+        "Ближние соседи весят больше", key="knn_distance",
+        help="Если включено, вклад соседа в оценку тем больше, чем он ближе по факторам.") else "uniform"
 if method in ("Случайный лес", "Гибридная модель (лес + kNN)"):
     params["trees"] = st.sidebar.select_slider(
         "Число деревьев", options=[50, 100, 300, 500], key="trees",
         help="Больше деревьев — устойчивее результат, но дольше расчёт.")
+    params["max_features"] = st.sidebar.select_slider(
+        "Доля факторов для каждого дерева", options=[0.33, 0.66, 1.0], key="max_features",
+        help="Какая часть факторов доступна дереву при каждом разбиении. Меньше — деревья разнообразнее.")
 
 split_type = st.sidebar.radio(
     "Способ проверки", SPLITS, key="split_type",
@@ -342,8 +365,8 @@ tab_compare, tab_region, tab_model, tab_factors, tab_whatif = st.tabs(
 # ---------- Вкладка: сравнение методов ----------
 with tab_compare:
     st.caption(f"Все методы обучены на одних и тех же данных ({len(features)} факторов, способ проверки "
-               f"«{split_type}») с начальными параметрами из плана работы. Параметры выбранного слева метода "
-               "можно менять и подбирать отдельно.")
+               f"«{split_type}») с параметрами, подобранными перебором по сетке на обучающей выборке (ноутбук 06). "
+               "Параметры выбранного слева метода можно менять и подбирать отдельно.")
     table = compare_methods(tuple(features), split_type)
     fig = px.bar(table.sort_values("R² на тесте"), x="R² на тесте", y="метод", orientation="h",
                  title="R² на тестовой выборке по методам", text_auto=".3f")
@@ -354,7 +377,9 @@ with tab_compare:
     st.dataframe(table.round(3), hide_index=True, width="stretch")
     st.caption("Чем длиннее столбец, тем точнее метод на спрятанных данных. Пунктирные линии: штрихи — целевой "
                "уровень 0,85, точки — допустимый уровень 0,8. Если «R² на обучении» намного выше «R² на тесте», "
-               "метод переобучается.")
+               "метод переобучается. Исключение — kNN с весом по расстоянию (и гибрид с ним): на обучающей выборке "
+               "каждая строка оказывается собственным ближайшим соседом, поэтому R² на обучении близок к 1 при "
+               "любых данных; для этого метода показателен только R² на тесте.")
 
 # ---------- Вкладка: регион ----------
 regions = sorted(data["region"].unique())

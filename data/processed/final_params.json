@@ -1,0 +1,26 @@
+{
+  "Линейная регрессия": {},
+  "Lasso": {
+    "alpha": 1
+  },
+  "Ridge": {
+    "alpha": 1
+  },
+  "ElasticNet": {
+    "alpha": 0.01,
+    "l1_ratio": 0.2
+  },
+  "Полиномиальная регрессия": {
+    "alpha": 10,
+    "degree": 3
+  },
+  "k ближайших соседей": {
+    "n_neighbors": 3,
+    "weights": "distance"
+  },
+  "Случайный лес": {
+    "max_features": 0.66,
+    "min_samples_leaf": 1,
+    "n_estimators": 300
+  }
+}
