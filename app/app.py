@@ -31,6 +31,7 @@ FINAL_PATH = ROOT / "data" / "processed" / "final_comparison.csv"  # резул�
 CAT_PATH = ROOT / "data" / "processed" / "crime_categories.csv"  # уровни по видам преступлений, ноутбук 07
 CAT_COMPARE_PATH = ROOT / "data" / "processed" / "category_comparison.csv"  # точность по видам, ноутбук 07
 CAT_FACTORS_PATH = ROOT / "data" / "processed" / "category_factors.csv"  # важность и направление по видам
+LIMITS_PATH = ROOT / "data" / "processed" / "scenario_limits.json"  # пределы сдвига для подбора, ноутбук 08
 
 # Виды преступлений: название в интерфейсе → (ключ, столбец с уровнем на 100 тыс. жителей)
 CATEGORIES = {
@@ -178,7 +179,8 @@ def freeze(p):
     return tuple(sorted(p.items()))
 
 
-num = lambda v, d: f"{v:,.{d}f}".replace(",", " ").replace(".", ",")  # 12 345,67
+num = lambda v, d: (f"{v:,.{d}f}".replace(",", "\u00a0").replace(".", ",")  # 12 345,67, пробел неразрывный
+                    .replace("-", "−"))
 
 
 @st.cache_resource
@@ -311,6 +313,95 @@ def scenario_effects(features, method, params, split_type, target, changes):
     return float(rel[0]), dict(zip(features, rel[1:].tolist()))
 
 
+# ---------- Подбор сценария с ограничениями (ноутбук 08) ----------
+# Управляемые факторы и пределы сдвига за 1 и 3 года (90-й процентиль наблюдавшихся изменений)
+LIMITS = json.loads(LIMITS_PATH.read_text(encoding="utf-8"))
+MANAGED = list(LIMITS["1"])
+SELECTION_NOTE = (
+    "Подбор меняет только безработицу и долю бедных: эти вопросы входят в полномочия органов власти субъекта "
+    "(занятость населения и социальная помощь малоимущим, закон № 414-ФЗ, ст. 44). Оба показателя можно только "
+    "снижать, и не сильнее, чем они менялись у 90 % регионов за выбранный срок: безработица — до "
+    f"{LIMITS['1']['unemployment']['limit']} % за год и {LIMITS['3']['unemployment']['limit']} % за три года, доля "
+    f"бедных — до {LIMITS['1']['poverty']['limit']} % и {LIMITS['3']['poverty']['limit']} %. Значения не выходят за "
+    "пределы того, что встречалось в регионах. Остальные показатели либо не зависят напрямую от решений региона "
+    "(образование, городское население, миграция), либо их связь с преступностью в данных объясняется "
+    "особенностями отдельных регионов (зарплата).")
+
+
+def select_scenario(features, method, params, split_type, target, horizon, region_values):
+    """Подбор: для каждого управляемого фактора перебираются сдвиги −5, −10, … до предела горизонта
+    (и не ниже минимума фактора в данных); выбирается сдвиг с наибольшим снижением оценки.
+    Возвращает таблицу по факторам (от сильного эффекта к слабому) и совместный эффект в процентах."""
+    rows = []
+    for f in MANAGED:
+        limit = LIMITS[horizon][f]["limit"]
+        floor_pct = (data[f].min() / region_values[f] - 1) * 100  # правило: не ниже минимума в данных
+        limit = min(limit, int(-floor_pct // 5 * 5))
+        best_pct, best_eff = 0, 0.0
+        for pct in range(-5, -limit - 1, -5):
+            changes = tuple(pct if g == f else 0 for g in features)
+            _, single = scenario_effects(features, method, params, split_type, target, changes)
+            if single[f] < best_eff:
+                best_pct, best_eff = pct, single[f]
+        rows.append({"код": f, "показатель": FEATURE_NAMES[f], "изменение показателя, %": best_pct,
+                     "изменение уровня преступности, %": best_eff})
+    table = pd.DataFrame(rows).sort_values("изменение уровня преступности, %").reset_index(drop=True)
+    chosen = {r["код"]: r["изменение показателя, %"] for _, r in table.iterrows() if r["изменение показателя, %"] < 0}
+    total = 0.0
+    if chosen:
+        total, _ = scenario_effects(features, method, params, split_type, target,
+                                    tuple(chosen.get(g, 0) for g in features))
+    return table, total
+
+
+def selection_block(features, method, params, split_type, target, region_values, level, slider_prefix, key):
+    """Блок «Подобрать сценарий»: выбор срока, кнопка, таблица результата и перенос в ползунки."""
+    with st.container(border=True):
+        st.markdown("**Подобрать сценарий.** Какое реалистичное снижение безработицы и бедности сильнее всего "
+                    "связано со снижением уровня преступности в регионе.")
+        horizon = st.radio("Срок сценария", ["1", "3"], format_func=lambda h: "1 год" if h == "1" else "3 года",
+                           horizontal=True, key=f"{key}_horizon",
+                           help="За какой срок нужно достичь изменений. От срока зависит, насколько сильно "
+                                "показатель может реально измениться.")
+        if st.button("Подобрать", key=f"{key}_run", type="primary"):
+            st.session_state[f"{key}_result"] = (horizon, target) + select_scenario(
+                features, method, params, split_type, target, horizon, region_values)
+        result = st.session_state.get(f"{key}_result")
+        if result and result[0] == horizon and result[1] == target:
+            _, _, table, total = result
+            used = table[table["изменение показателя, %"] < 0]
+            if used.empty:
+                st.info("Для выбранного вида преступлений снижение безработицы и бедности в допустимых пределах "
+                        "не связано со снижением оценки.")
+                return
+            new_level = level * (1 + total / 100)
+            accusative = {"unemployment": "безработицу", "poverty": "долю бедных"}
+            parts = [f"{accusative[r['код']]} на {abs(r['изменение показателя, %'])} %" for _, r in used.iterrows()]
+            st.markdown(f"Сценарий на {'1 год' if horizon == '1' else '3 года'}: снизить " + " и ".join(parts)
+                        + f". С этими условиями связано снижение уровня преступности примерно на "
+                          f"**{num(abs(total), 1)} %**: с {num(level, 0)} до {num(new_level, 0)} на 100 тыс. жителей.")
+            shown = table.drop(columns="код").copy()
+            shown["изменение показателя, %"] = shown["изменение показателя, %"].map(lambda v: num(v, 0))
+            shown["изменение уровня преступности, %"] = shown["изменение уровня преступности, %"].map(lambda v: num(v, 1))
+            st.dataframe(shown, hide_index=True, width="stretch")
+            st.caption("Строки упорядочены от более сильной связи к более слабой; в каждой строке — эффект "
+                       "изменения одного показателя. Если показатель в сценарий не вошёл (0 %), его снижение в "
+                       "допустимых пределах не связано со снижением оценки.")
+
+            def apply():
+                for f in features:
+                    st.session_state[f"{slider_prefix}{f}"] = 0
+                for _, r in used.iterrows():
+                    st.session_state[f"{slider_prefix}{r['код']}"] = int(r["изменение показателя, %"])
+
+            st.button("Перенести в ползунки", key=f"{key}_apply", on_click=apply,
+                      help="Выставляет подобранные изменения на ползунках ниже; остальные ползунки — в ноль.")
+        with st.expander("Как устроен подбор"):
+            st.markdown(SELECTION_NOTE + " Для каждого показателя перебираются снижения на 5, 10, 15 % и далее до "
+                        "предела и выбирается то, с которым связано наибольшее снижение преступности. Результат "
+                        "показывает связь в данных и не является прогнозом последствий мер.")
+
+
 def effects_chart(single, features):
     """Столбцы: на сколько процентов меняется уровень преступности от каждого изменения по отдельности."""
     eff = pd.DataFrame({"фактор": [FEATURE_NAMES[f] for f in features], "изменение, %": [single[f] for f in features]})
@@ -409,6 +500,8 @@ if mode == SIMPLE:
         for f in s_features:
             st.session_state[f"p_{f}"] = 0
 
+    selection_block(s_features, s_method, s_params, s_split, target, last, level, "p_", "s_sel")
+
     groups = {"Экономика": ["unemployment", "wage_rel", "poverty"],
               "Население и образование": ["urban", "migration", "students", "higher_edu_share"],
               "Работа правоохранительных органов": ["unsolved_share"]}
@@ -430,7 +523,9 @@ if mode == SIMPLE:
         new_level = level * (1 + total / 100)
         m1, m2 = st.columns(2)
         m1.metric(f"Сейчас ({year})", num(level, 0))
-        m2.metric("По сценарию", num(new_level, 0), delta=f"{num(new_level - level, 0)} ({total:+.1f} %)",
+        # в поле delta нужен обычный дефис: по нему Streamlit определяет знак и цвет стрелки
+        delta = f"{num(new_level - level, 0)} ({num(total, 1)} %)".replace("−", "-")
+        m2.metric("По сценарию", num(new_level, 0), delta=delta,
                   delta_color="inverse")
         direction = "снизиться" if total < 0 else "вырасти"
         st.markdown(f"При заданных изменениях уровень преступности в регионе может **{direction} примерно на "
@@ -797,6 +892,8 @@ with tab_whatif:
     row = data[(data["region"] == w_region) & (data["year"] == w_year)]
     base = row[features]
 
+    selection_block(tuple(features), method, freeze(params), split_type, target, row.iloc[0],
+                    row[target].iloc[0], "s_", "a_sel")
     st.caption("Ползунки: на сколько процентов изменить показатель относительно его реального значения "
                "в выбранном году.")
     scenario = base.copy()
