@@ -97,27 +97,49 @@ px.defaults.color_discrete_sequence = [ACCENT, SECOND]
 
 
 # ---------- Данные ----------
+def stamp(*paths):
+    """Время изменения и размер файлов. Передаётся в функции чтения как аргумент version: Streamlit запоминает
+    результат по аргументам, поэтому после обновления файла данные перечитываются, а не берутся из памяти."""
+    return tuple((p.stat().st_mtime_ns, p.stat().st_size) for p in paths)
+
+
 @st.cache_data
-def load_final():
+def load_final(version):
     """Готовые результаты окончательного сравнения методов (вложенная проверка считается несколько минут,
     поэтому в приложении не пересчитывается)."""
     return pd.read_csv(FINAL_PATH)
 
 
 @st.cache_data
-def load_data():
+def load_data(version):
     """Читает очищенную таблицу «регион × год» и добавляет уровни по видам преступлений."""
     panel = pd.read_csv(DATA_PATH)
     return panel.merge(pd.read_csv(CAT_PATH), on=["region", "year"], how="left")
 
 
 @st.cache_data
-def load_categories():
+def load_categories(version):
     """Готовые результаты ноутбука 07: точность моделей, важность и направление факторов по видам."""
     return pd.read_csv(CAT_COMPARE_PATH), pd.read_csv(CAT_FACTORS_PATH, index_col=0)
 
 
-data = load_data()
+# Если файлы данных обновились (например, после загрузки новой версии в репозиторий), запомненные
+# результаты (таблицы и обученные модели) очищаются: иначе приложение продолжило бы работать со старыми данными.
+DATA_FILES = [DATA_PATH, CAT_PATH, FEATURES_PATH, PARAMS_PATH, FINAL_PATH, CAT_COMPARE_PATH, CAT_FACTORS_PATH, LIMITS_PATH]
+
+
+@st.cache_resource
+def data_version_box():
+    return {"version": None}
+
+
+current_version = stamp(*DATA_FILES)
+if data_version_box()["version"] not in (None, current_version):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+data_version_box()["version"] = current_version
+
+data = load_data(stamp(DATA_PATH, CAT_PATH))
 
 
 # ---------- Модели ----------
@@ -838,7 +860,7 @@ with tab_compare:
                 "разброс;\n"
                 "- **по годам** — обучение на 2011–2019 гг., проверка на 2020–2022 гг.;\n"
                 "- **по регионам** — проверка на регионах, которых не было в обучении.")
-    final = load_final()
+    final = load_final(stamp(FINAL_PATH))
     checks = {"R² тест 70/30": "случайно 70/30", "R² вложенная, среднее": "вложенная 5 × 5",
               "R² по годам": "по годам", "R² по регионам": "по регионам"}
     order = final.sort_values("R² вложенная, среднее")["метод"].tolist()  # лучший метод — вверху графика
@@ -1037,7 +1059,7 @@ with tab_categories:
     st.markdown("Одинаково ли социально-экономические условия связаны с разными видами преступлений? Для каждого "
                 "вида гибридная модель обучена отдельно (8 факторов, параметры подобраны на обучающих данных) и "
                 "проверена теми же способами, что и для всех преступлений. Результаты рассчитаны заранее.")
-    cat_cmp, cat_fac = load_categories()
+    cat_cmp, cat_fac = load_categories(stamp(CAT_COMPARE_PATH, CAT_FACTORS_PATH))
     key_to_name = {v[0]: k for k, v in CATEGORIES.items()}
     cat_cmp["вид"] = list(CATEGORIES)  # порядок строк в таблице ноутбука 07 совпадает с CATEGORIES
     checks = {"R² тест 70/30": "случайно 70/30", "R² 5 частей": "перекрёстная, 5 частей", "R² по годам": "по годам",
