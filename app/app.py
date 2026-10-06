@@ -18,7 +18,8 @@ from sklearn.ensemble import RandomForestRegressor, VotingRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import ElasticNet, Lasso, LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit, KFold, cross_val_score, train_test_split
+from sklearn.model_selection import (GroupKFold, GroupShuffleSplit, KFold, cross_val_predict, cross_val_score,
+                                     train_test_split)
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
@@ -319,7 +320,7 @@ LIMITS = json.loads(LIMITS_PATH.read_text(encoding="utf-8"))
 MANAGED = list(LIMITS["1"])
 SELECTION_NOTE = (
     "Подбор меняет только безработицу и долю бедных: эти вопросы входят в полномочия органов власти субъекта "
-    "(занятость населения и социальная помощь малоимущим, закон № 414-ФЗ, ст. 44). Оба показателя можно только "
+    "(занятость населения и социальная помощь малоимущим, закон №\u00a0414-ФЗ, ст. 44). Оба показателя можно только "
     "снижать, и не сильнее, чем они менялись у 90 % регионов за выбранный срок: безработица — до "
     f"{LIMITS['1']['unemployment']['limit']} % за год и {LIMITS['3']['unemployment']['limit']} % за три года, доля "
     f"бедных — до {LIMITS['1']['poverty']['limit']} % и {LIMITS['3']['poverty']['limit']} %. Значения не выходят за "
@@ -400,6 +401,92 @@ def selection_block(features, method, params, split_type, target, region_values,
             st.markdown(SELECTION_NOTE + " Для каждого показателя перебираются снижения на 5, 10, 15 % и далее до "
                         "предела и выбирается то, с которым связано наибольшее снижение преступности. Результат "
                         "показывает связь в данных и не является прогнозом последствий мер.")
+
+
+# ---------- Выводы для региона (правило перехода к рекомендациям, методика, шаг 7) ----------
+MEASURES = {
+    "unemployment": ("содействие занятости: профессиональное обучение безработных, общественные и временные работы, "
+                     "ярмарки вакансий (полномочия региона: закон №\u00a0414-ФЗ, ст. 44, ч. 1, п. 134)"),
+    "poverty": ("социальная поддержка малоимущих граждан, в том числе по социальному контракту (закон №\u00a0414-ФЗ, "
+                "ст. 44, ч. 1, п. 49 и 50)"),
+}
+PREVENTION = ("профилактика правонарушений в формах, доступных региону: правовое информирование, социальная "
+              "адаптация, ресоциализация, помощь лицам, подверженным риску стать пострадавшими (закон №\u00a0182-ФЗ, "
+              "ст. 11 и 17), и анализ причин, которые модель не учитывает (работа правоохранительных органов, "
+              "особенности учёта, местные условия)")
+
+
+@st.cache_data
+def expected_levels(features, method, params, target):
+    """Ожидаемый уровень для каждой строки по данным других регионов: модель обучается без региона
+    (деление на 5 групп регионов), поэтому оценка показывает, какой уровень типичен для таких условий."""
+    model = make_model(method, dict(params))
+    pred = cross_val_predict(model, data[list(features)], data[target], cv=GroupKFold(n_splits=5),
+                             groups=data["region"])
+    rel = (data[target] / pred - 1) * 100
+    return pd.Series(pred, index=data.index), float(rel.abs().median())  # оценки и типичная ошибка, %
+
+
+def recommendations(features, method, params, split_type, target, row, r2):
+    """Выводы для региона по правилу методики: 1) проверка точности; 2) сравнение факта с ожидаемым уровнем;
+    3) управляемые факторы, у которых снижение связано со снижением преступности на обоих сроках;
+    4) приоритет — по положению региона относительно медианы; 5) направления мер и ограничения."""
+    if r2 < 0.8:
+        st.warning("Для этого вида преступлений модель недостаточно точна (меньше 80 % различий), поэтому выводы и "
+                   "рекомендации не формулируются. Данные выше можно использовать как справку.")
+        return
+    reliability = "высокая" if r2 >= 0.85 else "допустимая"
+    pred, typical_err = expected_levels(features, method, params, target)
+    fact, expected = row[target], pred.loc[row.name]
+    gap = (fact / expected - 1) * 100
+    same_year = data[data["year"] == row["year"]]
+    lines = [f"**Точность расчёта {reliability}** ({r2 * 100:.0f} % различий на проверочных данных)."]
+    if abs(gap) <= typical_err:
+        lines.append(f"**Уровень соответствует условиям региона.** Для регионов с такими условиями типичен уровень "
+                     f"около {num(expected, 0)} на 100 тыс. жителей, фактический — {num(fact, 0)} "
+                     f"({num(gap, 0)} %, в пределах точности расчёта ±{num(typical_err, 0)} %).")
+    elif gap > 0:
+        lines.append(f"**Уровень выше, чем обычно бывает при таких условиях:** {num(fact, 0)} против около "
+                     f"{num(expected, 0)} на 100 тыс. жителей (+{num(gap, 0)} % при точности ±{num(typical_err, 0)} %). "
+                     "Часть преступности связана с причинами, которых нет среди показателей модели.")
+    else:
+        lines.append(f"**Уровень ниже, чем обычно бывает при таких условиях:** {num(fact, 0)} против около "
+                     f"{num(expected, 0)} на 100 тыс. жителей ({num(gap, 0)} % при точности ±{num(typical_err, 0)} %). "
+                     "Причины могут быть разными: действующие меры профилактики, местные условия или неполный учёт "
+                     "преступлений.")
+        if row.get("flag_low_registration", False):
+            lines.append("Для этого региона при подготовке данных отмечен возможный недоучёт преступлений: "
+                         "регистрируемый уровень устойчиво намного ниже, чем в регионах с похожими условиями. "
+                         "Сравнение с ожидаемым уровнем здесь следует толковать осторожно.")
+    sel = {h: select_scenario(features, method, params, split_type, target, h, row)[0].set_index("код")
+           for h in ["1", "3"]}
+    main, extra = [], []
+    for f in MANAGED:
+        e1, e3 = sel["1"].loc[f, "изменение уровня преступности, %"], sel["3"].loc[f, "изменение уровня преступности, %"]
+        if e1 >= 0 or e3 >= 0:
+            continue  # связь неустойчива: на одном из сроков снижение фактора не снижает оценку
+        share = (same_year[f] < row[f]).mean() * 100
+        item = (f"{MEASURES[f][0].upper() + MEASURES[f][1:]}. {FEATURE_NAMES[f].split(',')[0]} в регионе "
+                f"{num(row[f], 1)} % — выше, чем у {share:.0f} % регионов; снижение на "
+                f"{abs(sel['3'].loc[f, 'изменение показателя, %'])} % за три года связано со снижением уровня "
+                f"преступности примерно на {num(abs(e3), 1)} %.")
+        (main if row[f] > same_year[f].median() else extra).append((e3, item))
+    if gap > typical_err:
+        main.insert(0, (-100.0, PREVENTION[0].upper() + PREVENTION[1:] + "."))
+    st.markdown("\n\n".join(lines))
+    if main:
+        st.markdown("**Первоочередные направления** (показатель хуже, чем у большинства регионов, или уровень выше "
+                    "ожидаемого):\n" + "\n".join(f"- {t}" for _, t in sorted(main)))
+    if extra:
+        st.markdown("**Дополнительные направления** (показатель уже не хуже типичного, резерв меньше):\n"
+                    + "\n".join(f"- {t}" for _, t in sorted(extra)))
+    if not main and not extra:
+        st.info("Снижение безработицы и бедности в допустимых пределах не связано устойчиво со снижением уровня "
+                "этого вида преступлений, поэтому направления мер по этим показателям не предлагаются.")
+    st.caption("Как получены выводы: ожидаемый уровень рассчитан моделью, которая обучалась без данных этого "
+               "региона; направления мер предлагаются только по показателям, которые входят в полномочия региона и "
+               "снижение которых связано со снижением преступности и на год, и на три года. Выводы показывают связь "
+               "в данных; результат мер они не гарантируют.")
 
 
 def effects_chart(single, features):
@@ -548,12 +635,17 @@ if mode == SIMPLE:
 - {WAGE_NOTE}
 """)
 
-    # --- 4. Точность ---
     model_s, tr_s, te_s = train(s_features, s_method, s_params, s_split, target)
     X_s, y_s = data[list(s_features)], data[target]
     pred_s = model_s.predict(X_s.iloc[te_s])
     r2_s, mae_s = r2_score(y_s.iloc[te_s], pred_s), mean_absolute_error(y_s.iloc[te_s], pred_s)
-    st.header("4. Насколько точны расчёты")
+
+    # --- 4. Выводы ---
+    st.header("4. Выводы для региона")
+    recommendations(s_features, s_method, s_params, s_split, target, last, r2_s)
+
+    # --- 5. Точность ---
+    st.header("5. Насколько точны расчёты")
     st.markdown(f"Модель проверена на данных, которые не использовались при её построении. Она объясняет около "
                 f"**{r2_s * 100:.0f} %** различий в уровне преступности между регионами и годами и ошибается "
                 f"в среднем на **{num(mae_s, 0)}** преступлений на 100 тыс. жителей (около "
